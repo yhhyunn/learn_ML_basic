@@ -452,3 +452,41 @@ print("\n✅ Pipeline complete!")
 print("   Next step: Build a HeteroGNN model for anomaly detection")
 print("   (Graph Autoencoder with HeteroSAGEConv layers)")
 ```
+
+
+
+
+
+
+import matplotlib.pyplot as plt
+import networkx as nx
+
+# hetero_graph = HeteroGraph(nx_graph)  # 이미 만들어둔 HeteroGraph
+G = hetero_graph.G  # 원본 NetworkX 그래프 접근
+
+# 레이아웃 선택
+pos = nx.spring_layout(G, k=2, seed=42)  # k를 키우면 노드 간격 넓어짐
+
+# 노드 타입별 색상 분리
+instance_nodes = [n for n, d in G.nodes(data=True) if d.get('node_type') == 'instance']
+net_nodes = [n for n, d in G.nodes(data=True) if d.get('node_type') == 'net']
+
+plt.figure(figsize=(20, 14))
+
+# 타입별로 다른 색/모양으로 그리기
+nx.draw_networkx_nodes(G, pos, nodelist=instance_nodes,
+                       node_color='#065A82', node_shape='s', node_size=300, alpha=0.9)
+nx.draw_networkx_nodes(G, pos, nodelist=net_nodes,
+                       node_color='#19D3A2', node_shape='o', node_size=300, alpha=0.9)
+
+nx.draw_networkx_edges(G, pos, alpha=0.3, arrows=True, arrowsize=10)
+
+# 노드 이름 전부 표시
+nx.draw_networkx_labels(G, pos, font_size=6, font_color='black')
+
+plt.legend(['Instance', 'Net'], loc='upper left')
+plt.title("Circuit Netlist Bipartite Graph")
+plt.axis('off')
+plt.tight_layout()
+plt.savefig('graph_vis.png', dpi=150, bbox_inches='tight')
+plt.show()
