@@ -490,3 +490,640 @@ plt.axis('off')
 plt.tight_layout()
 plt.savefig('graph_vis.png', dpi=150, bbox_inches='tight')
 plt.show()
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import networkx as nx
+from collections import defaultdict
+
+from deepsnap.hetero_graph import HeteroGraph
+from torch_geometric.nn import HeteroConv, SAGEConv
+
+
+# ================================================================
+# 1. CSV → NetworkX → DeepSNAP HeteroGraph (변경 없음)
+# ================================================================
+
+def build_hetero_graph(csv_path):
+    df = pd.read_csv(csv_path)
+    df = df.drop_duplicates(subset=['FromInst', 'Net', 'ToInst'], keep='first')
+    
+    G = nx.DiGraph()
+    
+    inst_driven_res = defaultdict(list)
+    inst_driven_tR = defaultdict(list)
+    inst_driven_tF = defaultdict(list)
+    inst_fan_out = defaultdict(int)
+    inst_fan_in = defaultdict(int)
+    
+    net_line_res = defaultdict(list)
+    net_line_cap = defaultdict(list)
+    net_loading_cap = defaultdict(list)
+    net_tR = defaultdict(list)
+    net_tF = defaultdict(list)
+    net_fan_out = defaultdict(int)
+    
+    for _, row in df.iterrows():
+        from_inst = row['FromInst']
+        net_name = row['Net']
+        to_inst = row['ToInst']
+        line_res = row['Line_res']
+        line_cap = row['Line_cap']
+        loading_cap = row['Loading_cap']
+        tR = row['tR(ps)']
+        tF = row['tF(ps)']
+        
+        inst_driven_res[from_inst].append(line_res)
+        inst_driven_tR[from_inst].append(tR)
+        inst_driven_tF[from_inst].append(tF)
+        inst_fan_out[from_inst] += 1
+        inst_fan_in[to_inst] += 1
+        
+        net_line_res[net_name].append(line_res)
+        net_line_cap[net_name].append(line_cap)
+        net_loading_cap[net_name].append(loading_cap)
+        net_tR[net_name].append(tR)
+        net_tF[net_name].append(tF)
+        net_fan_out[net_name] += 1
+    
+    all_instances = set(df['FromInst']).union(set(df['ToInst']))
+    all_nets = set(df['Net'])
+    
+    for inst in all_instances:
+        driven_res = inst_driven_res.get(inst, [0])
+        driven_tR = inst_driven_tR.get(inst, [0])
+        driven_tF = inst_driven_tF.get(inst, [0])
+        feature = [
+            inst_fan_out.get(inst, 0),
+            inst_fan_in.get(inst, 0),
+            np.mean(driven_res),
+            np.mean(driven_tR),
+            np.mean(driven_tF),
+        ]
+        G.add_node(inst, node_type='instance',
+                   node_feature=torch.tensor(feature, dtype=torch.float32),
+                   name=inst)
+    
+    for net in all_nets:
+        avg_res = np.mean(net_line_res[net])
+        avg_cap = np.mean(net_line_cap[net])
+        total_load = np.sum(net_loading_cap[net])
+        max_tR = np.max(net_tR[net])
+        max_tF = np.max(net_tF[net])
+        fo = net_fan_out[net]
+        rc_product = avg_res * total_load
+        feature = [avg_res, avg_cap, total_load, max_tR, max_tF, fo, rc_product]
+        G.add_node(net, node_type='net',
+                   node_feature=torch.tensor(feature, dtype=torch.float32),
+                   name=net)
+    
+    for _, row in df.iterrows():
+        edge_feat = torch.tensor([
+            row['Line_res'], row['Line_cap'], row['Loading_cap'],
+            row['tR(ps)'], row['tF(ps)']
+        ], dtype=torch.float32)
+        G.add_edge(row['FromInst'], row['Net'],
+                   edge_type='drives', edge_feature=edge_feat)
+        G.add_edge(row['Net'], row['ToInst'],
+                   edge_type='loads', edge_feature=edge_feat)
+    
+    hetero_graph = HeteroGraph(G)
+    return hetero_graph, G
+
+
+# ================================================================
+# 2. [NEW] Subgraph 분석 & 분류
+# ================================================================
+
+def analyze_components(nx_graph):
+    """Connected component 분석 및 크기별 분류"""
+    undirected = nx_graph.to_undirected()
+    components = list(nx.connected_components(undirected))
+    
+    sizes = [len(c) for c in components]
+    
+    print(f"=== Component Analysis ===")
+    print(f"Total components: {len(components)}")
+    print(f"Total nodes: {sum(sizes)}")
+    print(f"Size distribution:")
+    print(f"  1 node:     {sum(1 for s in sizes if s == 1)}")
+    print(f"  2-3 nodes:  {sum(1 for s in sizes if 2 <= s <= 3)}")
+    print(f"  4-6 nodes:  {sum(1 for s in sizes if 4 <= s <= 6)}")
+    print(f"  7-15 nodes: {sum(1 for s in sizes if 7 <= s <= 15)}")
+    print(f"  16+ nodes:  {sum(1 for s in sizes if s >= 16)}")
+    print(f"  Largest:    {max(sizes)} nodes")
+    print(f"  Median:     {np.median(sizes):.0f} nodes")
+    
+    return components, sizes
+
+
+def classify_nodes_by_component(nx_graph, min_gnn_size=5):
+    """
+    노드를 component 크기에 따라 GNN 대상 / MLP fallback 대상으로 분류
+    
+    Args:
+        min_gnn_size: 이 크기 이상의 component만 GNN 학습 대상
+                      (2-hop이 의미 있으려면 최소 5개 노드 필요)
+    Returns:
+        gnn_nodes: GNN 학습 대상 노드 set
+        mlp_nodes: MLP fallback 대상 노드 set
+    """
+    undirected = nx_graph.to_undirected()
+    components = list(nx.connected_components(undirected))
+    
+    gnn_nodes = set()
+    mlp_nodes = set()
+    
+    for comp in components:
+        if len(comp) >= min_gnn_size:
+            gnn_nodes.update(comp)
+        else:
+            mlp_nodes.update(comp)
+    
+    print(f"\nNode classification:")
+    print(f"  GNN target (component >= {min_gnn_size}): {len(gnn_nodes)} nodes")
+    print(f"  MLP fallback (component < {min_gnn_size}): {len(mlp_nodes)} nodes")
+    
+    return gnn_nodes, mlp_nodes
+
+
+# ================================================================
+# 3. Feature 정규화 (전체 데이터 기준으로 통일)
+# ================================================================
+
+class FeatureNormalizer:
+    """학습 시 fit, 추론 시 transform 분리"""
+    
+    def __init__(self):
+        self.mean = {}
+        self.std = {}
+    
+    def fit_transform(self, hetero_graph):
+        for ntype in hetero_graph.node_feature:
+            feat = hetero_graph.node_feature[ntype]
+            self.mean[ntype] = feat.mean(dim=0, keepdim=True)
+            self.std[ntype] = feat.std(dim=0, keepdim=True) + 1e-8
+            hetero_graph.node_feature[ntype] = (feat - self.mean[ntype]) / self.std[ntype]
+        return hetero_graph
+    
+    def transform(self, x, ntype):
+        return (x - self.mean[ntype]) / self.std[ntype]
+    
+    def inverse_transform(self, x, ntype):
+        return x * self.std[ntype] + self.mean[ntype]
+
+
+# ================================================================
+# 4. [NEW] Adaptive GNN Encoder (layer 수 조정 가능)
+# ================================================================
+
+class AdaptiveHeteroEncoder(nn.Module):
+    """
+    Subgraph 크기에 맞게 layer 수를 선택할 수 있는 Encoder.
+    작은 그래프에서는 1-layer, 큰 그래프에서는 2-layer 사용.
+    """
+    
+    def __init__(self, in_channels_dict, hidden_dim, latent_dim):
+        super().__init__()
+        
+        self.input_proj = nn.ModuleDict({
+            ntype: nn.Linear(in_ch, hidden_dim)
+            for ntype, in_ch in in_channels_dict.items()
+        })
+        
+        self.conv1 = HeteroConv({
+            ('instance', 'drives', 'net'): SAGEConv(hidden_dim, hidden_dim),
+            ('net', 'loads', 'instance'): SAGEConv(hidden_dim, hidden_dim),
+        }, aggr='mean')
+        
+        self.conv2 = HeteroConv({
+            ('instance', 'drives', 'net'): SAGEConv(hidden_dim, latent_dim),
+            ('net', 'loads', 'instance'): SAGEConv(hidden_dim, latent_dim),
+        }, aggr='mean')
+        
+        # 1-layer만 쓸 때를 위한 projection
+        self.one_layer_proj = nn.ModuleDict({
+            ntype: nn.Linear(hidden_dim, latent_dim)
+            for ntype in in_channels_dict
+        })
+        
+        self.bn1 = nn.ModuleDict({
+            ntype: nn.BatchNorm1d(hidden_dim)
+            for ntype in in_channels_dict
+        })
+    
+    def forward(self, x_dict, edge_index_dict, num_layers=2):
+        h_dict = {ntype: self.input_proj[ntype](x) for ntype, x in x_dict.items()}
+        
+        # Layer 1
+        h_dict = self.conv1(h_dict, edge_index_dict)
+        h_dict = {k: self.bn1[k](F.relu(v)) for k, v in h_dict.items()}
+        
+        if num_layers == 1:
+            z_dict = {k: self.one_layer_proj[k](v) for k, v in h_dict.items()}
+        else:
+            z_dict = self.conv2(h_dict, edge_index_dict)
+        
+        return z_dict
+
+
+# ================================================================
+# 5. [NEW] MLP Fallback (작은 subgraph용)
+# ================================================================
+
+class MLPAnomalyDetector(nn.Module):
+    """
+    작은 subgraph 노드용 — message passing 없이 feature만으로 학습.
+    GNN과 동일한 autoencoder 구조지만 graph 구조를 안 씀.
+    """
+    
+    def __init__(self, in_dim, hidden_dim, latent_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, in_dim),
+        )
+    
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        return x_hat, z
+    
+    def anomaly_score(self, x):
+        x_hat, _ = self.forward(x)
+        return ((x - x_hat) ** 2).mean(dim=1)
+
+
+# ================================================================
+# 6. Feature Decoder (변경 없음)
+# ================================================================
+
+class FeatureDecoder(nn.Module):
+    def __init__(self, latent_dim, out_channels_dict):
+        super().__init__()
+        self.decoders = nn.ModuleDict({
+            ntype: nn.Sequential(
+                nn.Linear(latent_dim, latent_dim * 2),
+                nn.ReLU(),
+                nn.Linear(latent_dim * 2, out_ch),
+            )
+            for ntype, out_ch in out_channels_dict.items()
+        })
+    
+    def forward(self, z_dict):
+        return {ntype: self.decoders[ntype](z) for ntype, z in z_dict.items()}
+
+
+# ================================================================
+# 7. [UPDATED] Hybrid Graph Autoencoder
+# ================================================================
+
+class HybridAutoencoder(nn.Module):
+    """GNN (큰 subgraph) + MLP (작은 subgraph) 하이브리드"""
+    
+    def __init__(self, in_channels_dict, hidden_dim, latent_dim):
+        super().__init__()
+        self.encoder = AdaptiveHeteroEncoder(in_channels_dict, hidden_dim, latent_dim)
+        self.decoder = FeatureDecoder(latent_dim, in_channels_dict)
+        
+        # 노드 타입별 MLP fallback
+        self.mlp_fallbacks = nn.ModuleDict({
+            ntype: MLPAnomalyDetector(in_ch, hidden_dim, latent_dim)
+            for ntype, in_ch in in_channels_dict.items()
+        })
+    
+    def forward(self, x_dict, edge_index_dict, num_layers=2):
+        z_dict = self.encoder(x_dict, edge_index_dict, num_layers)
+        x_hat_dict = self.decoder(z_dict)
+        return x_hat_dict, z_dict
+    
+    def compute_loss(self, x_dict, x_hat_dict):
+        total_loss = 0
+        for ntype in x_dict:
+            total_loss += F.mse_loss(x_hat_dict[ntype], x_dict[ntype])
+        return total_loss
+    
+    def anomaly_score(self, x_dict, x_hat_dict):
+        scores = {}
+        for ntype in x_dict:
+            scores[ntype] = ((x_dict[ntype] - x_hat_dict[ntype]) ** 2).mean(dim=1)
+        return scores
+
+
+# ================================================================
+# 8. DeepSNAP → PyG dict 변환
+# ================================================================
+
+def hetero_graph_to_pyg_dicts(hetero_graph):
+    x_dict = {}
+    for ntype in hetero_graph.node_feature:
+        x_dict[ntype] = hetero_graph.node_feature[ntype]
+    
+    edge_index_dict = {}
+    for etype in hetero_graph.edge_index:
+        edge_index_dict[etype] = hetero_graph.edge_index[etype]
+    
+    return x_dict, edge_index_dict
+
+
+# ================================================================
+# 9. [NEW] 노드 인덱스 매핑
+# ================================================================
+
+def build_node_index_maps(nx_graph, hetero_graph):
+    """
+    NetworkX 노드 이름 → DeepSNAP 내부 인덱스 매핑.
+    anomaly score를 노드 이름과 연결하기 위해 필요.
+    """
+    maps = {}
+    for ntype in hetero_graph.node_feature:
+        # DeepSNAP은 node_type별로 0부터 인덱싱
+        typed_nodes = [n for n, d in nx_graph.nodes(data=True)
+                       if d.get('node_type') == ntype]
+        maps[ntype] = typed_nodes  # index i → node name
+    return maps
+
+
+# ================================================================
+# 10. [NEW] 학습 + 평가 통합
+# ================================================================
+
+def train_epoch(model, x_dict, edge_index_dict, optimizer):
+    model.train()
+    optimizer.zero_grad()
+    x_hat_dict, z_dict = model(x_dict, edge_index_dict)
+    loss = model.compute_loss(x_dict, x_hat_dict)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+
+def train_mlp_epoch(mlp_model, x, optimizer):
+    mlp_model.train()
+    optimizer.zero_grad()
+    x_hat, z = mlp_model(x)
+    loss = F.mse_loss(x_hat, x)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+
+@torch.no_grad()
+def compute_all_scores(model, x_dict, edge_index_dict,
+                       mlp_models, mlp_x_dict,
+                       node_maps, gnn_nodes, mlp_nodes):
+    """GNN score + MLP score를 합쳐서 전체 net 노드의 anomaly score 산출"""
+    model.eval()
+    
+    # --- GNN scores (큰 component) ---
+    x_hat_dict, z_dict = model(x_dict, edge_index_dict)
+    gnn_scores = model.anomaly_score(x_dict, x_hat_dict)
+    
+    # --- MLP scores (작은 component) ---
+    mlp_scores = {}
+    for ntype, mlp in mlp_models.items():
+        mlp.eval()
+        if ntype in mlp_x_dict and mlp_x_dict[ntype].shape[0] > 0:
+            mlp_scores[ntype] = mlp.anomaly_score(mlp_x_dict[ntype])
+    
+    # --- 합치기: 모든 net 노드의 최종 score ---
+    net_names = node_maps['net']
+    all_scores = {}
+    
+    gnn_net_names = [n for n in net_names if n in gnn_nodes]
+    mlp_net_names = [n for n in net_names if n in mlp_nodes]
+    
+    # GNN net 인덱스 → score
+    gnn_net_indices = [i for i, n in enumerate(net_names) if n in gnn_nodes]
+    for local_idx, global_idx in enumerate(gnn_net_indices):
+        name = net_names[global_idx]
+        all_scores[name] = gnn_scores['net'][local_idx].item()
+    
+    # MLP net 인덱스 → score
+    if 'net' in mlp_scores:
+        mlp_net_indices = [i for i, n in enumerate(net_names) if n in mlp_nodes]
+        for local_idx, global_idx in enumerate(mlp_net_indices):
+            name = net_names[global_idx]
+            all_scores[name] = mlp_scores['net'][local_idx].item()
+    
+    return all_scores
+
+
+# ================================================================
+# 11. [UPDATED] 메인 실행
+# ================================================================
+
+def main():
+    csv_path = 'your_netlist.csv'  # ← 너의 CSV 경로
+    
+    # ---- Step 1: 그래프 구성 ----
+    print("Building graph from CSV...")
+    hetero_graph, nx_graph = build_hetero_graph(csv_path)
+    
+    # ---- Step 2: Component 분석 ----
+    components, sizes = analyze_components(nx_graph)
+    gnn_nodes, mlp_nodes = classify_nodes_by_component(nx_graph, min_gnn_size=5)
+    
+    # ---- Step 3: GNN용 / MLP용 subgraph 분리 ----
+    gnn_subgraph = nx_graph.subgraph(gnn_nodes).copy()
+    mlp_subgraph = nx_graph.subgraph(mlp_nodes).copy()
+    
+    print(f"\nGNN subgraph: {gnn_subgraph.number_of_nodes()} nodes, "
+          f"{gnn_subgraph.number_of_edges()} edges")
+    print(f"MLP subgraph: {mlp_subgraph.number_of_nodes()} nodes")
+    
+    # ---- Step 4: 정규화 (전체 기준) ----
+    normalizer = FeatureNormalizer()
+    hetero_graph = normalizer.fit_transform(hetero_graph)
+    
+    # ---- Step 5: GNN 데이터 준비 ----
+    if gnn_subgraph.number_of_nodes() > 0:
+        gnn_hetero = HeteroGraph(gnn_subgraph)
+        # 정규화는 전체 기준 mean/std 사용
+        for ntype in gnn_hetero.node_feature:
+            gnn_hetero.node_feature[ntype] = normalizer.transform(
+                gnn_hetero.node_feature[ntype], ntype)
+        
+        x_dict, edge_index_dict = hetero_graph_to_pyg_dicts(gnn_hetero)
+        in_channels_dict = {ntype: x.shape[1] for ntype, x in x_dict.items()}
+        node_maps = build_node_index_maps(gnn_subgraph, gnn_hetero)
+    else:
+        print("No components large enough for GNN!")
+        x_dict, edge_index_dict = {}, {}
+        in_channels_dict = {}
+        node_maps = {}
+    
+    # ---- Step 6: MLP 데이터 준비 ----
+    mlp_x_dict = {}
+    mlp_node_maps = {}
+    for ntype in ['instance', 'net']:
+        typed_nodes = [n for n, d in mlp_subgraph.nodes(data=True)
+                       if d.get('node_type') == ntype]
+        if typed_nodes:
+            feats = torch.stack([mlp_subgraph.nodes[n]['node_feature']
+                                for n in typed_nodes])
+            mlp_x_dict[ntype] = normalizer.transform(feats, ntype)
+            mlp_node_maps[ntype] = typed_nodes
+    
+    # ---- Step 7: 모델 생성 ----
+    hidden_dim = 32
+    latent_dim = 16
+    
+    # GNN model
+    if in_channels_dict:
+        gnn_model = HybridAutoencoder(in_channels_dict, hidden_dim, latent_dim)
+        gnn_optimizer = torch.optim.Adam(gnn_model.parameters(),
+                                          lr=0.005, weight_decay=1e-5)
+        print(f"\nGNN parameters: {sum(p.numel() for p in gnn_model.parameters()):,}")
+    
+    # MLP models (노드 타입별)
+    mlp_models = nn.ModuleDict()
+    mlp_optimizers = {}
+    for ntype, x in mlp_x_dict.items():
+        mlp_models[ntype] = MLPAnomalyDetector(x.shape[1], hidden_dim, latent_dim)
+        mlp_optimizers[ntype] = torch.optim.Adam(
+            mlp_models[ntype].parameters(), lr=0.005, weight_decay=1e-5)
+    
+    if mlp_x_dict:
+        total_mlp_params = sum(p.numel() for p in mlp_models.parameters())
+        print(f"MLP parameters: {total_mlp_params:,}")
+    
+    # ---- Step 8: 학습 ----
+    num_epochs = 300
+    best_gnn_loss = float('inf')
+    best_mlp_loss = {ntype: float('inf') for ntype in mlp_x_dict}
+    patience = 30
+    gnn_patience_counter = 0
+    
+    print(f"\n=== Training ===")
+    
+    for epoch in range(1, num_epochs + 1):
+        # GNN 학습
+        gnn_loss = 0
+        if in_channels_dict:
+            gnn_loss = train_epoch(gnn_model, x_dict, edge_index_dict, gnn_optimizer)
+            if gnn_loss < best_gnn_loss:
+                best_gnn_loss = gnn_loss
+                gnn_patience_counter = 0
+                torch.save(gnn_model.state_dict(), 'best_gnn_model.pt')
+            else:
+                gnn_patience_counter += 1
+        
+        # MLP 학습
+        mlp_loss = {}
+        for ntype in mlp_x_dict:
+            ml = train_mlp_epoch(mlp_models[ntype], mlp_x_dict[ntype],
+                                  mlp_optimizers[ntype])
+            mlp_loss[ntype] = ml
+            if ml < best_mlp_loss[ntype]:
+                best_mlp_loss[ntype] = ml
+                torch.save(mlp_models[ntype].state_dict(),
+                           f'best_mlp_{ntype}.pt')
+        
+        if epoch % 30 == 0:
+            mlp_str = ", ".join(f"MLP-{k}: {v:.6f}" for k, v in mlp_loss.items())
+            print(f"Epoch {epoch:3d} | GNN: {gnn_loss:.6f} | {mlp_str}")
+        
+        if gnn_patience_counter >= patience and in_channels_dict:
+            print(f"GNN early stopping at epoch {epoch}")
+            break
+    
+    # ---- Step 9: 평가 ----
+    print(f"\n=== Evaluation ===")
+    
+    # Best model 로드
+    if in_channels_dict:
+        gnn_model.load_state_dict(torch.load('best_gnn_model.pt'))
+        gnn_model.eval()
+    
+    for ntype in mlp_x_dict:
+        mlp_models[ntype].load_state_dict(torch.load(f'best_mlp_{ntype}.pt'))
+        mlp_models[ntype].eval()
+    
+    # 전체 net anomaly scores
+    all_net_scores = {}
+    
+    # GNN scores
+    if in_channels_dict:
+        with torch.no_grad():
+            x_hat_dict, z_dict = gnn_model(x_dict, edge_index_dict)
+            gnn_scores = gnn_model.anomaly_score(x_dict, x_hat_dict)
+        
+        if 'net' in node_maps:
+            for i, name in enumerate(node_maps['net']):
+                all_net_scores[name] = gnn_scores['net'][i].item()
+    
+    # MLP scores
+    if 'net' in mlp_x_dict:
+        with torch.no_grad():
+            mlp_sc = mlp_models['net'].anomaly_score(mlp_x_dict['net'])
+        for i, name in enumerate(mlp_node_maps.get('net', [])):
+            all_net_scores[name] = mlp_sc[i].item()
+    
+    # ---- Step 10: 결과 출력 ----
+    if not all_net_scores:
+        print("No net scores computed!")
+        return
+    
+    scores_array = np.array(list(all_net_scores.values()))
+    names_array = list(all_net_scores.keys())
+    
+    print(f"\nTotal nets scored: {len(scores_array)}")
+    print(f"  GNN-scored: {len([n for n in names_array if n in gnn_nodes])}")
+    print(f"  MLP-scored: {len([n for n in names_array if n in mlp_nodes])}")
+    print(f"\nAnomaly Score Statistics:")
+    print(f"  Mean:   {scores_array.mean():.6f}")
+    print(f"  Std:    {scores_array.std():.6f}")
+    print(f"  Median: {np.median(scores_array):.6f}")
+    print(f"  Max:    {scores_array.max():.6f}")
+    
+    # Top-K
+    top_k = min(20, len(names_array))
+    sorted_indices = np.argsort(scores_array)[::-1][:top_k]
+    
+    print(f"\n=== Top {top_k} Anomalous Nets ===")
+    print(f"{'Rank':<6}{'Net Name':<35}{'Score':<12}{'Method':<8}")
+    print("-" * 61)
+    for rank, idx in enumerate(sorted_indices, 1):
+        name = names_array[idx]
+        method = "GNN" if name in gnn_nodes else "MLP"
+        print(f"{rank:<6}{name:<35}{scores_array[idx]:<12.6f}{method:<8}")
+    
+    # IQR threshold
+    q75 = np.percentile(scores_array, 75)
+    q25 = np.percentile(scores_array, 25)
+    iqr = q75 - q25
+    threshold = q75 + 1.5 * iqr
+    
+    anomalous_mask = scores_array > threshold
+    print(f"\n=== Anomaly Summary (threshold: {threshold:.6f}) ===")
+    print(f"Anomalous nets: {anomalous_mask.sum()} / {len(scores_array)}")
+    
+    anomalous_nets = [(names_array[i], scores_array[i])
+                      for i in range(len(names_array)) if anomalous_mask[i]]
+    anomalous_nets.sort(key=lambda x: x[1], reverse=True)
+    
+    for name, score in anomalous_nets:
+        method = "GNN" if name in gnn_nodes else "MLP"
+        print(f"  [{method}] {name}: {score:.6f}")
+    
+    return gnn_model, mlp_models, all_net_scores
+
+
+if __name__ == '__main__':
+    gnn_model, mlp_models, scores = main()
