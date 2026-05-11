@@ -1127,3 +1127,261 @@ def main():
 
 if __name__ == '__main__':
     gnn_model, mlp_models, scores = main()
+    
+    
+    
+    
+    
+    
+    
+    
+    
+“””
+CSV Comparison Script (old vs new)
+
+- Validates column structure between old and new CSV files
+- Compares rows by a unique key column
+- Carries over ‘Check’ and ‘Comment’ values from old to new for fully matching rows
+  “””
+
+import polars as pl
+from pathlib import Path
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Configuration
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 비교 시 항상 제외할 컬럼들 (사용자 메타 컬럼)
+
+META_COLUMNS = [“Check”, “Comment”]
+
+# 추가로 비교에서 제외할 컬럼이 있다면 여기에 (필요 없으면 빈 리스트)
+
+EXTRA_EXCLUDE_COLUMNS: list[str] = []
+
+# Row 매칭의 기준이 되는 unique key 컬럼
+
+KEY_COLUMN = “Name”  # ← 실제 key 컬럼명으로 변경
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Validation
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def validate_columns(old: pl.DataFrame, new: pl.DataFrame) -> list[str]:
+“””
+old/new 컬럼 구조를 검증하고, 비교에 사용할 컬럼 리스트를 반환한다.
+
+```
+Rules:
+  - len(new) > len(old)  → Error (새 컬럼이 추가된 상태로는 정확한 비교 불가)
+  - len(old) > len(new)  → old가 new 컬럼을 모두 포함해야 함. 그렇지 않으면 Error.
+                           포함하면 new 컬럼 기준으로 비교 진행.
+  - len(old) == len(new) → 컬럼 집합이 동일해야 함.
+"""
+old_cols = set(old.columns)
+new_cols = set(new.columns)
+
+if len(new.columns) > len(old.columns):
+    extra = new_cols - old_cols
+    raise ValueError(
+        f"new CSV has more columns than old CSV "
+        f"(old={len(old.columns)}, new={len(new.columns)}). "
+        f"Extra columns in new: {sorted(extra)}"
+    )
+
+if len(old.columns) > len(new.columns):
+    if not new_cols.issubset(old_cols):
+        missing = new_cols - old_cols
+        raise ValueError(
+            f"old CSV does not contain all columns of new CSV. "
+            f"Missing in old: {sorted(missing)}"
+        )
+    # new 컬럼 기준으로 비교
+    return list(new.columns)
+
+# 같은 개수일 때 — 컬럼 집합도 같아야 함
+if old_cols != new_cols:
+    raise ValueError(
+        f"Column sets differ. "
+        f"Only in old: {sorted(old_cols - new_cols)}, "
+        f"Only in new: {sorted(new_cols - old_cols)}"
+    )
+return list(new.columns)
+```
+
+def validate_key_column(
+old: pl.DataFrame, new: pl.DataFrame, key: str
+) -> None:
+“”“Key 컬럼 존재 여부와 unique 여부 검증.”””
+for label, df in [(“old”, old), (“new”, new)]:
+if key not in df.columns:
+raise ValueError(f”Key column ‘{key}’ not found in {label} CSV.”)
+n_total = df.height
+n_unique = df.select(pl.col(key).n_unique()).item()
+if n_total != n_unique:
+raise ValueError(
+f”Key column ‘{key}’ is not unique in {label} CSV “
+f”({n_total} rows, {n_unique} unique values).”
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Comparison
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compare_and_carry_over(
+old: pl.DataFrame,
+new: pl.DataFrame,
+key: str,
+common_columns: list[str],
+exclude_columns: list[str],
+) -> tuple[pl.DataFrame, dict]:
+“””
+Key 기준으로 old/new를 매칭하고, 비교 대상 컬럼 값이 모두 일치하는 row에 한해
+old의 Check/Comment 값을 new에 적용한다.
+
+```
+Returns:
+    updated_new: Check/Comment가 carry-over된 new DataFrame
+    stats: 통계 정보 dict
+"""
+# 비교 대상 컬럼 = common_columns − (META + EXTRA_EXCLUDE) − key
+compare_cols = [
+    c for c in common_columns
+    if c not in exclude_columns and c != key
+]
+
+if not compare_cols:
+    raise ValueError("No columns left to compare after exclusions.")
+
+# old에서 필요한 컬럼만 추출 (key + 비교 컬럼 + 메타 컬럼)
+old_meta_cols = [c for c in META_COLUMNS if c in old.columns]
+old_subset = old.select([key] + compare_cols + old_meta_cols)
+
+# 비교 컬럼명에 suffix 붙여서 join (충돌 방지)
+old_for_join = old_subset.rename(
+    {c: f"{c}__old" for c in compare_cols}
+    | {c: f"{c}__old" for c in old_meta_cols}
+)
+
+# new에 old를 left join
+joined = new.join(old_for_join, on=key, how="left")
+
+# 모든 비교 컬럼에서 old == new 인지 확인하는 마스크 생성
+#   - null/null도 일치로 간주하기 위해 eq_missing 사용
+match_expr = pl.lit(True)
+for c in compare_cols:
+    match_expr = match_expr & pl.col(c).eq_missing(pl.col(f"{c}__old"))
+
+# key가 old에 존재해야 매칭 가능 → key__old가 null이 아닌 경우만
+# (left join이므로 old에 없으면 모든 __old 컬럼이 null)
+# → match_expr만으로는 "둘 다 null"인 컬럼이 많을 때 False positive 위험이 있어,
+#   old에 해당 key가 실재했는지 별도로 확인
+old_keys = set(old.select(key).to_series().to_list())
+joined = joined.with_columns(
+    pl.col(key).is_in(list(old_keys)).alias("__key_in_old")
+)
+
+fully_matched = pl.col("__key_in_old") & match_expr
+
+# Check/Comment carry-over: 일치하는 row에 한해 old 값으로 덮어쓰기
+update_exprs = []
+for meta in META_COLUMNS:
+    if meta in new.columns and f"{meta}__old" in joined.columns:
+        update_exprs.append(
+            pl.when(fully_matched)
+            .then(pl.col(f"{meta}__old"))
+            .otherwise(pl.col(meta))
+            .alias(meta)
+        )
+    elif meta not in new.columns and f"{meta}__old" in joined.columns:
+        # new에 메타 컬럼이 없으면 매칭된 row만 값 채우고 나머지는 null
+        update_exprs.append(
+            pl.when(fully_matched)
+            .then(pl.col(f"{meta}__old"))
+            .otherwise(None)
+            .alias(meta)
+        )
+
+if update_exprs:
+    joined = joined.with_columns(update_exprs)
+
+# 통계 산출
+n_new = new.height
+n_matched = joined.filter(fully_matched).height
+n_key_hit = joined.filter(pl.col("__key_in_old")).height
+n_key_miss = n_new - n_key_hit
+n_value_diff = n_key_hit - n_matched
+
+stats = {
+    "total_new_rows": n_new,
+    "key_found_in_old": n_key_hit,
+    "key_not_in_old": n_key_miss,
+    "fully_matched_rows": n_matched,
+    "value_mismatch_rows": n_value_diff,
+    "carried_over_columns": [m for m in META_COLUMNS if m in old.columns],
+    "compared_columns": compare_cols,
+}
+
+# 정리: 임시 컬럼 제거하고 new의 원래 컬럼 순서 유지
+drop_cols = [c for c in joined.columns
+             if c.endswith("__old") or c == "__key_in_old"]
+result = joined.drop(drop_cols)
+
+# new에 원래 없던 META 컬럼이 추가됐다면 그대로 유지, 아니면 원래 순서로
+final_cols = list(new.columns)
+for meta in META_COLUMNS:
+    if meta in result.columns and meta not in final_cols:
+        final_cols.append(meta)
+result = result.select(final_cols)
+
+return result, stats
+```
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Main
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run(old_path: str | Path, new_path: str | Path, out_path: str | Path) -> None:
+old = pl.read_csv(old_path)
+new = pl.read_csv(new_path)
+
+```
+common_columns = validate_columns(old, new)
+validate_key_column(old, new, KEY_COLUMN)
+
+exclude = META_COLUMNS + EXTRA_EXCLUDE_COLUMNS
+updated_new, stats = compare_and_carry_over(
+    old=old,
+    new=new,
+    key=KEY_COLUMN,
+    common_columns=common_columns,
+    exclude_columns=exclude,
+)
+
+updated_new.write_csv(out_path)
+
+print("=" * 60)
+print("CSV Comparison Summary")
+print("=" * 60)
+for k, v in stats.items():
+    if isinstance(v, list):
+        print(f"  {k}: {len(v)} columns")
+    else:
+        print(f"  {k}: {v}")
+print(f"\nOutput written to: {out_path}")
+```
+
+if **name** == “**main**”:
+run(
+old_path=“old.csv”,
+new_path=“new.csv”,
+out_path=“new_updated.csv”,
+)
