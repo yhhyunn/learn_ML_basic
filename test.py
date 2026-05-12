@@ -1385,3 +1385,221 @@ old_path=“old.csv”,
 new_path=“new.csv”,
 out_path=“new_updated.csv”,
 )
+
+
+
+“””
+Batch CSV Comparison: dir0 (old) vs dir1 (new) — hardcoded config version
+
+For each filename that exists in both dir0 and dir1 (top-level only):
+
+- Load each pair as old/new
+- Run the comparison logic from csv_compare
+- Write the carry-over result into dir1 with a suffix indicating the source
+
+Per-file errors are logged and skipped; the batch continues.
+
+Usage:
+python batch_compare_hardcoded.py <dir0> <dir1>
+“””
+
+import argparse
+import sys
+import traceback
+from pathlib import Path
+
+import polars as pl
+
+import csv_compare
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Hardcoded configuration
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 파일명별 key 컬럼 매핑. 매핑에 없는 파일은 DEFAULT_KEYS를 사용한다.
+
+KEY_COLUMNS_MAP: dict[str, list[str]] = {
+“netlist.csv”:   [“Name”, “Net”],
+“parasitic.csv”: [“Instance”, “Pin”],
+# 필요한 파일 추가…
+}
+
+# 위 매핑에 없는 파일에 적용할 기본 key
+
+DEFAULT_KEYS: list[str] = [“Name”]
+
+# 모든 파일에서 비교 전에 제거할 컬럼 (없으면 빈 리스트)
+
+EXTRA_EXCLUDE_COLUMNS: list[str] = []
+
+def resolve_keys(filename: str) -> list[str]:
+“”“Get KEY_COLUMNS for this filename, falling back to default.”””
+return KEY_COLUMNS_MAP.get(filename, DEFAULT_KEYS)
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# File discovery
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def find_common_csv_files(
+dir0: Path, dir1: Path
+) -> tuple[list[str], list[str], list[str]]:
+“””
+Find CSV files that exist in both directories (top-level, by filename).
+
+```
+Returns:
+    common: filenames present in both
+    only_in_dir0: filenames only in dir0
+    only_in_dir1: filenames only in dir1
+"""
+files0 = {p.name for p in dir0.iterdir()
+          if p.is_file() and p.suffix.lower() == ".csv"}
+files1 = {p.name for p in dir1.iterdir()
+          if p.is_file() and p.suffix.lower() == ".csv"}
+common = sorted(files0 & files1)
+only0 = sorted(files0 - files1)
+only1 = sorted(files1 - files0)
+return common, only0, only1
+```
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Per-file comparison
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compare_one_file(
+old_path: Path,
+new_path: Path,
+out_path: Path,
+keys: list[str],
+extra_exclude: list[str],
+) -> dict:
+“””
+Run the full compare pipeline for one file pair.
+Takes per-file keys/exclude as arguments instead of reading module globals.
+“””
+old = pl.read_csv(old_path)
+new = pl.read_csv(new_path)
+
+```
+old = csv_compare.drop_excluded_columns(old, extra_exclude)
+new = csv_compare.drop_excluded_columns(new, extra_exclude)
+
+common_columns = csv_compare.validate_columns(old, new)
+csv_compare.validate_key_columns(old, new, keys)
+
+updated_new, stats = csv_compare.compare_and_carry_over(
+    old=old,
+    new=new,
+    keys=keys,
+    common_columns=common_columns,
+)
+
+updated_new.write_csv(out_path)
+return stats
+```
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Batch driver
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_output_path(dir1: Path, filename: str, dir0_label: str) -> Path:
+“””
+e.g. netlist.csv + dir0_label=‘baseline’ → dir1/netlist__vs_baseline.csv
+“””
+stem = Path(filename).stem
+suffix = Path(filename).suffix
+return dir1 / f”{stem}_*vs*{dir0_label}{suffix}”
+
+def run_batch(dir0: Path, dir1: Path) -> None:
+common, only0, only1 = find_common_csv_files(dir0, dir1)
+dir0_label = dir0.name
+
+```
+print("=" * 70)
+print(f"Batch CSV Comparison")
+print(f"  dir0 (old): {dir0}")
+print(f"  dir1 (new): {dir1}")
+print("=" * 70)
+print(f"Common files     : {len(common)}")
+print(f"Only in dir0     : {len(only0)}  {only0 if only0 else ''}")
+print(f"Only in dir1     : {len(only1)}  {only1 if only1 else ''}")
+print("-" * 70)
+
+success: list[str] = []
+failed: list[tuple[str, str]] = []
+
+for filename in common:
+    keys = resolve_keys(filename)
+    old_path = dir0 / filename
+    new_path = dir1 / filename
+    out_path = build_output_path(dir1, filename, dir0_label)
+
+    print(f"\n[{filename}]  keys={keys}")
+    try:
+        stats = compare_one_file(
+            old_path=old_path,
+            new_path=new_path,
+            out_path=out_path,
+            keys=keys,
+            extra_exclude=EXTRA_EXCLUDE_COLUMNS,
+        )
+        print(f"  matched={stats['fully_matched_rows']}/{stats['total_new_rows']}  "
+              f"key_miss={stats['key_not_in_old']}  "
+              f"value_diff={stats['value_mismatch_rows']}")
+        print(f"  → {out_path.name}")
+        success.append(filename)
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        print(f"  [SKIP] {msg}")
+        failed.append((filename, msg))
+
+print("\n" + "=" * 70)
+print(f"Batch summary: {len(success)} succeeded, {len(failed)} skipped")
+print("=" * 70)
+if failed:
+    print("Skipped files:")
+    for fname, reason in failed:
+        print(f"  - {fname}: {reason}")
+```
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+# CLI
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+p = argparse.ArgumentParser(
+description=“Batch-compare CSV files between two directories.”
+)
+p.add_argument(“dir0”, type=Path, help=“Directory with old CSVs”)
+p.add_argument(“dir1”, type=Path,
+help=“Directory with new CSVs (output also goes here)”)
+args = p.parse_args()
+
+```
+for d in (args.dir0, args.dir1):
+    if not d.is_dir():
+        p.error(f"Not a directory: {d}")
+return args
+```
+
+def main() -> int:
+args = parse_args()
+try:
+run_batch(args.dir0, args.dir1)
+except Exception:
+traceback.print_exc()
+return 1
+return 0
+
+if **name** == “**main**”:
+sys.exit(main())
